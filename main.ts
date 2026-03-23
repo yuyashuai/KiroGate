@@ -43,8 +43,11 @@ import {
 import {
   renderHomePage, renderDocsPage, renderPlaygroundPage, renderDeployPage,
   renderDashboardPage, renderSwaggerPage, renderAccountsPage, renderApiKeysPage,
-  generateOpenAPISpec
+  renderDebugPage, generateOpenAPISpec
 } from './lib/pages.ts'
+import {
+  debugStore, extractPromptFromOpenAI, extractPromptFromClaude, StreamDebugger
+} from './lib/debugger.ts'
 
 // ============================================================================
 // 静态资源代理基地址
@@ -99,6 +102,7 @@ const metrics = {
 
 // Token 刷新相关
 const KIRO_REFRESH_URL = (region: string) => `https://prod.${region}.auth.desktop.kiro.dev/refreshToken`
+const IDC_OIDC_URL = (region: string) => `https://oidc.${region}.amazonaws.com/token`
 
 // ============================================================================
 // Token 刷新
@@ -106,32 +110,68 @@ const KIRO_REFRESH_URL = (region: string) => `https://prod.${region}.auth.deskto
 async function refreshAccountToken(account: ProxyAccount): Promise<boolean> {
   if (!account.refreshToken) return false
   const region = account.region || 'us-east-1'
+  const isIdC = account.authMethod === 'idc' || account.authMethod === 'IdC'
+
   try {
-    const resp = await fetch(KIRO_REFRESH_URL(region), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refreshToken: account.refreshToken })
-    })
-    if (!resp.ok) {
-      const text = await resp.text()
-      logger.error('Auth', `Refresh failed for ${account.email || account.id}: ${resp.status} ${text.slice(0, 200)}`)
-      if (resp.status === 400 || resp.status === 401) {
-        accountPool.markRefreshComplete(account.id, false, undefined, true)
+    let newToken: string
+    let expiresIn: number
+    let newRefreshToken: string | undefined
+
+    if (isIdC && account.clientId && account.clientSecret) {
+      // IdC (Identity Center) SSO OIDC token refresh
+      const resp = await fetch(IDC_OIDC_URL(region), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clientId: account.clientId,
+          clientSecret: account.clientSecret,
+          grantType: 'refresh_token',
+          refreshToken: account.refreshToken
+        })
+      })
+      if (!resp.ok) {
+        const text = await resp.text()
+        logger.error('Auth', `IdC refresh failed for ${account.email || account.id}: ${resp.status} ${text.slice(0, 200)}`)
+        if (resp.status === 400 || resp.status === 401) {
+          accountPool.markRefreshComplete(account.id, false, undefined, true)
+          return false
+        }
+        accountPool.markRefreshComplete(account.id, false)
         return false
       }
-      accountPool.markRefreshComplete(account.id, false)
-      return false
+      const data = await resp.json()
+      newToken = data.accessToken || data.access_token
+      expiresIn = data.expiresIn || data.expires_in || 3600
+      newRefreshToken = data.refreshToken || data.refresh_token
+    } else {
+      // Default: Kiro desktop auth refresh
+      const resp = await fetch(KIRO_REFRESH_URL(region), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refreshToken: account.refreshToken })
+      })
+      if (!resp.ok) {
+        const text = await resp.text()
+        logger.error('Auth', `Refresh failed for ${account.email || account.id}: ${resp.status} ${text.slice(0, 200)}`)
+        if (resp.status === 400 || resp.status === 401) {
+          accountPool.markRefreshComplete(account.id, false, undefined, true)
+          return false
+        }
+        accountPool.markRefreshComplete(account.id, false)
+        return false
+      }
+      const data = await resp.json()
+      newToken = data.accessToken || data.access_token
+      expiresIn = data.expiresIn || data.expires_in || 3600
+      newRefreshToken = data.refreshToken
     }
-    const data = await resp.json()
-    const newToken = data.accessToken || data.access_token
-    const expiresIn = data.expiresIn || data.expires_in || 3600
+
     if (!newToken) { accountPool.markRefreshComplete(account.id, false); return false }
     accountPool.updateAccount(account.id, {
       accessToken: newToken,
       expiresAt: Date.now() + expiresIn * 1000,
-      refreshToken: data.refreshToken || account.refreshToken
+      refreshToken: newRefreshToken || account.refreshToken
     })
     accountPool.markRefreshComplete(account.id, true)
-    logger.info('Auth', `Token refreshed for ${account.email || account.id}`)
+    logger.info('Auth', `Token refreshed for ${account.email || account.id} (${isIdC ? 'IdC' : 'desktop'})`)
     return true
   } catch (e) {
     logger.error('Auth', `Refresh error: ${(e as Error).message}`)
@@ -253,6 +293,7 @@ async function getAccountFromRefreshToken(refreshToken: string): Promise<ProxyAc
 // OpenAI Chat Completions 处理器
 // ============================================================================
 async function handleChatCompletions(req: Request): Promise<Response> {
+  const startTime = Date.now()
   const authResult = await verifyApiKey(req)
   if (!authResult.valid) {
     return Response.json({ error: { message: 'Invalid or missing API Key', type: 'authentication_error' } }, { status: 401 })
@@ -267,8 +308,25 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   const isStream = body.stream === true
   logger.info('API', `OpenAI: model=${model} stream=${isStream} msgs=${(body.messages as unknown[])?.length || 0}`)
 
+  // 创建调试会话
+  const debugSessionId = debugStore.createSession({
+    method: 'POST',
+    path: '/v1/chat/completions',
+    model,
+    requestedModel: body.model as string,
+    apiKeyId: authResult.apiKeyId,
+    requestHeaders: Object.fromEntries(req.headers.entries()),
+    requestBody: body,
+    prompt: extractPromptFromOpenAI(body)
+  })
+
   // 限流检查
   if (settings.rateLimitPerMinute > 0 && !rateLimiter.tryAcquire('global').allowed) {
+    debugStore.updateSession(debugSessionId, {
+      responseStatus: 429,
+      error: 'Rate limit exceeded',
+      duration: Date.now() - startTime
+    })
     return Response.json({ error: { message: 'Rate limit exceeded', type: 'rate_limit_error' } }, { status: 429 })
   }
 
@@ -278,8 +336,15 @@ async function handleChatCompletions(req: Request): Promise<Response> {
       ? await getAccountFromRefreshToken(authResult.refreshToken)
       : await selectAccount(model, authResult.accountId)
 
+    debugStore.updateSession(debugSessionId, { accountId: account.id })
+
     // 熔断器检查
     if (!circuitBreaker.canExecute()) {
+      debugStore.updateSession(debugSessionId, {
+        responseStatus: 503,
+        error: 'Service temporarily unavailable (circuit breaker open)',
+        duration: Date.now() - startTime
+      })
       return Response.json({ error: { message: 'Service temporarily unavailable (circuit breaker open)', type: 'server_error' } }, { status: 503 })
     }
 
@@ -288,29 +353,42 @@ async function handleChatCompletions(req: Request): Promise<Response> {
     const kiroPayload = openaiToKiro(body as any, account.profileArn, thinkingEnabled)
 
     if (isStream) {
-      return handleOpenAIStream(account, kiroPayload, model, thinkingEnabled)
+      return handleOpenAIStream(account, kiroPayload, model, thinkingEnabled, debugSessionId, startTime)
     } else {
-      return await handleOpenAINonStream(account, kiroPayload, model, thinkingEnabled)
+      return await handleOpenAINonStream(account, kiroPayload, model, thinkingEnabled, debugSessionId, startTime)
     }
   } catch (e) {
     const err = e as Error
     logger.error('API', `OpenAI error: ${err.message}`)
     const classified = classifyError(err)
     circuitBreaker.recordFailure()
+    debugStore.updateSession(debugSessionId, {
+      responseStatus: classified.type === 'AUTH' ? 401 : classified.type === 'RATE_LIMIT' ? 429 : 500,
+      error: err.message,
+      errorStack: err.stack,
+      duration: Date.now() - startTime
+    })
     return Response.json({
       error: { message: err.message, type: classified.type === 'AUTH' ? 'authentication_error' : 'server_error' }
     }, { status: classified.type === 'AUTH' ? 401 : classified.type === 'RATE_LIMIT' ? 429 : 500 })
   }
 }
 
-function handleOpenAIStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean): Response {
+function handleOpenAIStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean, debugSessionId: string, startTime: number): Response {
   const encoder = new TextEncoder()
+  const streamDebugger = new StreamDebugger(debugSessionId)
+
   const stream = new ReadableStream({
     start(controller) {
+      let closed = false
+      const safeClose = () => { if (!closed) { closed = true; try { controller.close() } catch { /* ignore */ } } }
+      const safeEnqueue = (data: Uint8Array) => { if (!closed) { try { controller.enqueue(data) } catch { closed = true } } }
+
       const handler = new OpenAIStreamHandler({
         model, enableThinkingParsing: thinkingEnabled,
         onWrite: (data: string) => {
-          try { controller.enqueue(encoder.encode(data)); return true }
+          streamDebugger.addChunk(data)
+          try { safeEnqueue(encoder.encode(data)); return true }
           catch { return false }
         }
       })
@@ -341,16 +419,26 @@ function handleOpenAIStream(account: ProxyAccount, payload: any, model: string, 
           })
           circuitBreaker.recordSuccess()
           accountPool.recordSuccess(account.id, usage.outputTokens)
-          controller.close()
+          streamDebugger.finish()
+          debugStore.updateSession(debugSessionId, {
+            responseStatus: 200,
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            duration: Date.now() - startTime
+          })
+          safeClose()
         },
         (error) => {
           circuitBreaker.recordFailure()
           accountPool.recordError(account.id, 'other')
-          try {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: error.message })}\n\n`))
-            controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-          } catch { /* ignore */ }
-          controller.close()
+          debugStore.updateSession(debugSessionId, {
+            responseStatus: 500,
+            error: error.message,
+            duration: Date.now() - startTime
+          })
+          safeEnqueue(encoder.encode(`data: ${JSON.stringify({ error: error.message })}\n\n`))
+          safeEnqueue(encoder.encode('data: [DONE]\n\n'))
+          safeClose()
         },
         undefined, undefined, thinkingEnabled
       )
@@ -362,13 +450,22 @@ function handleOpenAIStream(account: ProxyAccount, payload: any, model: string, 
   })
 }
 
-async function handleOpenAINonStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean): Promise<Response> {
+async function handleOpenAINonStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean, debugSessionId: string, startTime: number): Promise<Response> {
   const result = await callKiroApi(account, payload, undefined, undefined, thinkingEnabled)
   circuitBreaker.recordSuccess()
   accountPool.recordSuccess(account.id, result.usage.outputTokens)
   const response = kiroToOpenaiResponse(result.content, result.toolUses, {
     inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens
   }, model)
+
+  debugStore.updateSession(debugSessionId, {
+    responseStatus: 200,
+    responseBody: response,
+    inputTokens: result.usage.inputTokens,
+    outputTokens: result.usage.outputTokens,
+    duration: Date.now() - startTime
+  })
+
   return Response.json(response)
 }
 
@@ -376,6 +473,7 @@ async function handleOpenAINonStream(account: ProxyAccount, payload: any, model:
 // Anthropic Messages 处理器
 // ============================================================================
 async function handleAnthropicMessages(req: Request): Promise<Response> {
+  const startTime = Date.now()
   const authResult = await verifyApiKey(req)
   if (!authResult.valid) {
     return Response.json({ type: 'error', error: { type: 'authentication_error', message: 'Invalid or missing API Key' } }, { status: 401 })
@@ -390,7 +488,24 @@ async function handleAnthropicMessages(req: Request): Promise<Response> {
   const isStream = body.stream === true
   logger.info('API', `Claude: model=${model} stream=${isStream} msgs=${(body.messages as unknown[])?.length || 0}`)
 
+  // 创建调试会话
+  const debugSessionId = debugStore.createSession({
+    method: 'POST',
+    path: '/v1/messages',
+    model,
+    requestedModel: body.model as string,
+    apiKeyId: authResult.apiKeyId,
+    requestHeaders: Object.fromEntries(req.headers.entries()),
+    requestBody: body,
+    prompt: extractPromptFromClaude(body)
+  })
+
   if (settings.rateLimitPerMinute > 0 && !rateLimiter.tryAcquire('global').allowed) {
+    debugStore.updateSession(debugSessionId, {
+      responseStatus: 429,
+      error: 'Rate limit exceeded',
+      duration: Date.now() - startTime
+    })
     return Response.json({ type: 'error', error: { type: 'rate_limit_error', message: 'Rate limit exceeded' } }, { status: 429 })
   }
 
@@ -399,7 +514,14 @@ async function handleAnthropicMessages(req: Request): Promise<Response> {
       ? await getAccountFromRefreshToken(authResult.refreshToken)
       : await selectAccount(model, authResult.accountId)
 
+    debugStore.updateSession(debugSessionId, { accountId: account.id })
+
     if (!circuitBreaker.canExecute()) {
+      debugStore.updateSession(debugSessionId, {
+        responseStatus: 529,
+        error: 'Service temporarily unavailable',
+        duration: Date.now() - startTime
+      })
       return Response.json({ type: 'error', error: { type: 'overloaded_error', message: 'Service temporarily unavailable' } }, { status: 529 })
     }
 
@@ -407,26 +529,39 @@ async function handleAnthropicMessages(req: Request): Promise<Response> {
     const kiroPayload = claudeToKiro(body as any, account.profileArn, thinkingEnabled)
 
     if (isStream) {
-      return handleClaudeStream(account, kiroPayload, model, thinkingEnabled)
+      return handleClaudeStream(account, kiroPayload, model, thinkingEnabled, debugSessionId, startTime)
     } else {
-      return await handleClaudeNonStream(account, kiroPayload, model, thinkingEnabled)
+      return await handleClaudeNonStream(account, kiroPayload, model, thinkingEnabled, debugSessionId, startTime)
     }
   } catch (e) {
     const err = e as Error
     logger.error('API', `Claude error: ${err.message}`)
     circuitBreaker.recordFailure()
+    debugStore.updateSession(debugSessionId, {
+      responseStatus: 500,
+      error: err.message,
+      errorStack: err.stack,
+      duration: Date.now() - startTime
+    })
     return Response.json({ type: 'error', error: { type: 'api_error', message: err.message } }, { status: 500 })
   }
 }
 
-function handleClaudeStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean): Response {
+function handleClaudeStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean, debugSessionId: string, startTime: number): Response {
   const encoder = new TextEncoder()
+  const streamDebugger = new StreamDebugger(debugSessionId)
+
   const stream = new ReadableStream({
     start(controller) {
+      let closed = false
+      const safeClose = () => { if (!closed) { closed = true; try { controller.close() } catch { /* ignore */ } } }
+      const safeEnqueue = (data: Uint8Array) => { if (!closed) { try { controller.enqueue(data) } catch { closed = true } } }
+
       const handler = new ClaudeStreamHandler({
         model, inputTokens: 0, enableThinkingParsing: thinkingEnabled,
         onWrite: (data: string) => {
-          try { controller.enqueue(encoder.encode(data)); return true }
+          streamDebugger.addChunk(data)
+          try { safeEnqueue(encoder.encode(data)); return true }
           catch { return false }
         }
       })
@@ -456,15 +591,25 @@ function handleClaudeStream(account: ProxyAccount, payload: any, model: string, 
           })
           circuitBreaker.recordSuccess()
           accountPool.recordSuccess(account.id, usage.outputTokens)
-          controller.close()
+          streamDebugger.finish()
+          debugStore.updateSession(debugSessionId, {
+            responseStatus: 200,
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            duration: Date.now() - startTime
+          })
+          safeClose()
         },
         (error) => {
           circuitBreaker.recordFailure()
           accountPool.recordError(account.id, 'other')
-          try {
-            controller.enqueue(encoder.encode(claudeSSE.error(error.message)))
-          } catch { /* ignore */ }
-          controller.close()
+          debugStore.updateSession(debugSessionId, {
+            responseStatus: 500,
+            error: error.message,
+            duration: Date.now() - startTime
+          })
+          safeEnqueue(encoder.encode(claudeSSE.error(error.message)))
+          safeClose()
         },
         undefined, undefined, thinkingEnabled
       )
@@ -476,13 +621,22 @@ function handleClaudeStream(account: ProxyAccount, payload: any, model: string, 
   })
 }
 
-async function handleClaudeNonStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean): Promise<Response> {
+async function handleClaudeNonStream(account: ProxyAccount, payload: any, model: string, thinkingEnabled: boolean, debugSessionId: string, startTime: number): Promise<Response> {
   const result = await callKiroApi(account, payload, undefined, undefined, thinkingEnabled)
   circuitBreaker.recordSuccess()
   accountPool.recordSuccess(account.id, result.usage.outputTokens)
   const response = kiroToClaudeResponse(result.content, result.toolUses, {
     inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens
   }, model)
+
+  debugStore.updateSession(debugSessionId, {
+    responseStatus: 200,
+    responseBody: response,
+    inputTokens: result.usage.inputTokens,
+    outputTokens: result.usage.outputTokens,
+    duration: Date.now() - startTime
+  })
+
   return Response.json(response)
 }
 
@@ -537,9 +691,11 @@ async function handleAccountsApi(req: Request, path: string): Promise<Response> 
     }
     const id = body.id as string || `acc_${crypto.randomUUID().slice(0, 8)}`
     const account: ProxyAccount = {
-      id, email: (body.email as string) || '', accessToken: '',
+      id, email: (body.email as string) || '', accessToken: (body.accessToken as string) || '',
       refreshToken, region: (body.region as string) || 'us-east-1',
       machineId: body.machineId as string, profileArn: body.profileArn as string,
+      authMethod: body.authMethod as ProxyAccount['authMethod'],
+      clientId: body.clientId as string, clientSecret: body.clientSecret as string,
       isAvailable: true, disabled: false, requestCount: 0, errorCount: 0
     }
     accountPool.addAccount(account)
@@ -796,6 +952,62 @@ async function handleSettingsApi(req: Request, path: string): Promise<Response> 
   return Response.json({ error: 'Not found' }, { status: 404 })
 }
 
+// 调试 API 处理
+async function handleDebugApi(req: Request, path: string): Promise<Response> {
+  const guard = adminGuard(req)
+  if (guard) return guard
+
+  // GET /api/debug/sessions - 获取所有调试会话
+  if (req.method === 'GET' && path === '/api/debug/sessions') {
+    const sessions = debugStore.getAllSessions()
+    const stats = debugStore.getStats()
+    return Response.json({
+      sessions: sessions.map(s => ({
+        id: s.id,
+        timestamp: s.timestamp,
+        method: s.method,
+        path: s.path,
+        model: s.model,
+        responseStatus: s.responseStatus,
+        duration: s.duration,
+        inputTokens: s.inputTokens,
+        outputTokens: s.outputTokens,
+        error: s.error,
+        accountId: s.accountId,
+        apiKeyId: s.apiKeyId
+      })),
+      enabled: stats.enabled,
+      maxSessions: stats.maxSessions
+    })
+  }
+
+  // GET /api/debug/sessions/:id - 获取单个会话详情
+  if (req.method === 'GET' && path.startsWith('/api/debug/sessions/')) {
+    const id = path.split('/').pop()
+    if (!id) return Response.json({ error: 'Invalid session ID' }, { status: 400 })
+
+    const session = debugStore.getSession(id)
+    if (!session) return Response.json({ error: 'Session not found' }, { status: 404 })
+
+    return Response.json(session)
+  }
+
+  // POST /api/debug/toggle - 切换调试模式
+  if (req.method === 'POST' && path === '/api/debug/toggle') {
+    const currentState = debugStore.isEnabled()
+    debugStore.setEnabled(!currentState)
+    return Response.json({ enabled: !currentState })
+  }
+
+  // DELETE /api/debug/sessions - 清空所有会话
+  if (req.method === 'DELETE' && path === '/api/debug/sessions') {
+    debugStore.clearSessions()
+    return Response.json({ success: true })
+  }
+
+  return Response.json({ error: 'Not found' }, { status: 404 })
+}
+
 // GET /api/models - 获取可用模型列表
 async function handleModelsApi(req: Request): Promise<Response> {
   const authResult = await verifyApiKey(req)
@@ -871,6 +1083,7 @@ async function handleRequest(req: Request): Promise<Response> {
         case '/playground': return htmlResponse(renderPlaygroundPage(APP_VERSION))
         case '/deploy': return htmlResponse(renderDeployPage(APP_VERSION))
         case '/dashboard': return htmlResponse(renderDashboardPage(APP_VERSION))
+        case '/debug': return htmlResponse(renderDebugPage(APP_VERSION))
         case '/swagger': return htmlResponse(renderSwaggerPage(APP_VERSION))
         case '/admin/accounts': return htmlResponse(renderAccountsPage(APP_VERSION))
         case '/admin/keys': return htmlResponse(renderApiKeysPage(APP_VERSION))
@@ -922,6 +1135,11 @@ async function handleRequest(req: Request): Promise<Response> {
     // 设置
     if (path.startsWith('/api/settings')) {
       return await handleSettingsApi(req, path)
+    }
+
+    // 调试 API
+    if (path.startsWith('/api/debug')) {
+      return await handleDebugApi(req, path)
     }
 
     // 404
@@ -1028,7 +1246,13 @@ async function main() {
   logger.info('Init', `Rate limit: ${settings.rateLimitPerMinute || 'disabled'}`)
 
   // 启动 HTTP 服务器
-  Deno.serve({ port: settings.port }, handleRequest)
+  Deno.serve({ port: settings.port, hostname: '127.0.0.1' }, handleRequest)
 }
+
+// 防止未捕获的异常导致进程崩溃
+globalThis.addEventListener('unhandledrejection', (event) => {
+  logger.error('Process', `Unhandled rejection: ${event.reason?.message || event.reason}`)
+  event.preventDefault()
+})
 
 main()
