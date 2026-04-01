@@ -1,235 +1,170 @@
-<div align="center">
-
 # KiroGate
 
-**OpenAI & Anthropic 兼容的 Kiro IDE API 代理网关**
+OpenAI / Anthropic 兼容的 Kiro API 代理网关，通过任何支持 OpenAI 或 Anthropic API 的工具使用 Claude 模型。
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Deno](https://img.shields.io/badge/Deno-2.x-blue.svg)](https://deno.land/)
-
-*通过任何支持 OpenAI 或 Anthropic API 的工具使用 Claude 模型*
-
-[功能特性](#-功能特性) • [快速开始](#-快速开始) • [配置说明](#%EF%B8%8F-配置说明) • [API 参考](#-api-参考) • [部署](#-部署)
-
-</div>
-
----
-
-> **致谢**: 本项目基于 [kiro-openai-gateway](https://github.com/Jwadow/kiro-openai-gateway) by [@Jwadow](https://github.com/jwadow) 开发，整合 [kiro-account-manager](https://github.com/dext7r/kiro-account-manager) 全部功能。
-
----
-
-## ✨ 功能特性
+## 主要功能
 
 - **双 API 兼容** — 同时支持 OpenAI (`/v1/chat/completions`) 和 Anthropic (`/v1/messages`) 格式
-- **完整流式传输** — SSE 流式响应，支持 Thinking 标签解析
-- **工具调用** — 完整的 Function Calling / Tool Use 支持
-- **多账号智能调度** — 账号池 + 健康分数 + 自动故障转移 + 配额追踪
-- **多租户认证** — 简单 API Key / 组合模式 / 托管 API Key 三种认证方式
-- **上下文压缩** — 三层缓存 + AI 摘要，自动压缩超长对话
-- **熔断器 + 限流** — 令牌桶限流 + 熔断器模式保护后端
-- **管理面板** — 内置 Web UI，账号管理、API Key 管理、Dashboard 监控
-- **零外部依赖** — Deno 原生运行，内置 KV 存储，无需 Redis/数据库
+- **多账号智能调度** — 账号池 + 健康评分 + 自动故障转移
+- **双认证方式** — Kiro Desktop Token 和 AWS IdC (Identity Center) OIDC
+- **流式传输** — SSE 流式响应，支持 Thinking 标签解析
+- **工具调用** — Function Calling / Tool Use 支持
+- **管理面板** — Web UI 管理账号、API Key、监控
+- **零外部依赖** — Deno 原生运行，内置 KV 存储
 
-## 📁 项目结构
+## 部署
 
-```
-kirogate/
-├── main.ts              # 入口 + HTTP 路由 + 管理 API
-├── lib/
-│   ├── types.ts         # 类型定义
-│   ├── kiroApi.ts       # Kiro API 客户端（双端点、DNS 缓存、机器码）
-│   ├── accountPool.ts   # 多账号智能调度池
-│   ├── translator.ts    # 格式转换（OpenAI ↔ Kiro ↔ Claude）
-│   ├── stream.ts        # 流处理（AWS Event Stream + SSE）
-│   ├── compressor.ts    # 上下文压缩（三层缓存 + AI 摘要）
-│   ├── storage.ts       # Deno KV 存储层
-│   ├── rateLimiter.ts   # 令牌桶限流
-│   ├── errorHandler.ts  # 错误分类 + 熔断器
-│   ├── logger.ts        # 日志系统
-│   └── pages.ts         # 嵌入式 HTML 前端页面
-├── deno.json            # Deno 配置
-├── Dockerfile
-└── docker-compose.yml
-```
-
-## 🚀 快速开始
-
-### 环境要求
-
-- [Deno](https://deno.land/) 2.x+
-
-### 本地运行
+### 1. 安装 Deno
 
 ```bash
-# 设置环境变量
-export PROXY_API_KEY="your-secret-api-key"
-export ADMIN_PASSWORD="your-admin-password"
+curl -fsSL https://deno.land/install.sh | sh
+export PATH="$HOME/.deno/bin:$PATH"
+```
 
-# 启动服务
+### 2. 启动服务
+
+```bash
+cd /path/to/KiroGate
+
+export PROXY_API_KEY="your-api-key"       # 客户端调用密钥
+export ADMIN_PASSWORD="your-admin-pwd"    # 管理面板密码
+
+# 前台运行
 deno run --allow-net --allow-env --unstable-kv main.ts
 
-# 或使用 deno task
-deno task start
-
-# 开发模式（自动重载）
-deno task dev
+# 后台运行
+nohup deno run --allow-net --allow-env --unstable-kv main.ts > /tmp/kirogate.log 2>&1 &
 ```
 
-服务启动后访问 `http://localhost:8000` 查看首页。
+服务默认监听 `http://localhost:8000`，绑定 127.0.0.1，仅本地可访问。
 
-### 添加账号
-
-1. 访问 `http://localhost:8000/admin/accounts`
-2. 输入管理密码（`ADMIN_PASSWORD`）
-3. 点击「添加账号」，粘贴 Kiro 的 Refresh Token
-4. 系统会自动刷新 Access Token
-
-### 发送请求
-
-```bash
-# OpenAI 格式
-curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer your-secret-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-sonnet-4-5",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "stream": true
-  }'
-
-# Anthropic 格式
-curl http://localhost:8000/v1/messages \
-  -H "x-api-key: your-secret-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-sonnet-4-5",
-    "max_tokens": 1024,
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-```
-
-## ⚙️ 配置说明
-
-通过环境变量配置：
+### 环境变量
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `PROXY_API_KEY` | `changeme_proxy_secret` | API 代理密钥 |
 | `ADMIN_PASSWORD` | `admin` | 管理面板密码 |
 | `PORT` | `8000` | 监听端口 |
-| `LOG_LEVEL` | `INFO` | 日志级别（DEBUG/INFO/WARN/ERROR） |
+| `LOG_LEVEL` | `INFO` | 日志级别 |
 | `RATE_LIMIT_PER_MINUTE` | `0` | 全局限流（0=不限） |
-| `ENABLE_COMPRESSION` | `true` | 启用上下文压缩 |
+| `ENABLE_COMPRESSION` | `true` | 上下文压缩 |
 
-## 🔑 认证方式
+### Docker
 
-支持三种认证模式：
-
-### 模式 1: 简单模式
-
-使用 `PROXY_API_KEY` 直接认证，请求由服务端账号池分配账号：
-
-```
-Authorization: Bearer YOUR_PROXY_API_KEY
+```bash
+docker build -t kirogate .
+docker run -d -p 8000:8000 \
+  -e PROXY_API_KEY="your-key" \
+  -e ADMIN_PASSWORD="your-pwd" \
+  kirogate
 ```
 
-### 模式 2: 组合模式（多租户）
+## 配置账号
 
-用户自带 Refresh Token，格式为 `PROXY_API_KEY:REFRESH_TOKEN`：
+KiroGate 需要 Kiro 的认证信息才能代理请求。支持两种认证方式。
 
+### 获取 Token
+
+从本地 Kiro 缓存中提取：
+
+```bash
+# Refresh Token + 认证信息
+cat ~/.aws/sso/cache/kiro-auth-token.json
+
+# OIDC 客户端凭证（IdC 方式需要）
+# 文件名为 clientId 的 SHA1 哈希，可通过 kiro-auth-token.json 中的 clientIdHash 字段找到
+cat ~/.aws/sso/cache/<clientIdHash>.json
 ```
-Authorization: Bearer YOUR_PROXY_API_KEY:YOUR_REFRESH_TOKEN
+
+### 方式 A：Web 管理面板
+
+打开 `http://localhost:8000/admin/accounts`，输入管理密码后填写表单：
+
+**Kiro Desktop 方式（默认）：**
+- Refresh Token（必填）：从 `kiro-auth-token.json` 的 `refreshToken` 字段复制
+- Region：`us-east-1`
+
+**IdC (Identity Center) 方式：**
+- 认证方式：选择 `IdC`
+- Refresh Token（必填）：同上
+- Client ID（必填）：从 OIDC 客户端凭证文件的 `clientId` 字段复制
+- Client Secret（必填）：从 OIDC 客户端凭证文件的 `clientSecret` 字段复制
+- Region：`us-east-1`
+
+### 方式 B：命令行
+
+```bash
+curl -X POST http://localhost:8000/api/accounts \
+  -H "Authorization: Bearer your-admin-pwd" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "refreshToken": "从 kiro-auth-token.json 复制",
+    "authMethod": "IdC",
+    "clientId": "从 OIDC 客户端凭证文件复制",
+    "clientSecret": "从 OIDC 客户端凭证文件复制",
+    "region": "us-east-1"
+  }'
 ```
 
-### 模式 3: 托管 API Key
+> Kiro Desktop 方式不需要 `authMethod`、`clientId`、`clientSecret` 字段。
 
-通过管理面板创建的 `kg-` 前缀 Key，支持额度限制和模型限制：
+## 使用
 
+### API 端点
+
+| 格式 | Base URL | 端点 | 认证头 |
+|------|----------|------|--------|
+| OpenAI | `http://localhost:8000/v1` | `/v1/chat/completions` | `Authorization: Bearer KEY` |
+| Anthropic | `http://localhost:8000` | `/v1/messages` | `x-api-key: KEY` |
+
+### 快速测试
+
+```bash
+# 健康检查
+curl http://localhost:8000/health
+
+# OpenAI 格式
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "Hi"}],
+    "stream": false
+  }'
+
+# Anthropic 格式
+curl http://localhost:8000/v1/messages \
+  -H "x-api-key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Hi"}]
+  }'
 ```
-Authorization: Bearer kg-xxxxxxxxxxxxxxxx
-```
 
-## 📡 API 参考
+### SDK 示例
 
-### 代理端点
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `GET` | `/v1/models` | 获取可用模型列表 |
-| `POST` | `/v1/chat/completions` | OpenAI 聊天补全 |
-| `POST` | `/v1/messages` | Anthropic Messages API |
-| `GET` | `/health` | 健康检查 |
-
-### 管理端点（需 Admin 密码）
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `GET/POST` | `/api/accounts` | 账号列表 / 添加账号 |
-| `PUT/DELETE` | `/api/accounts/:id` | 更新 / 删除账号 |
-| `POST` | `/api/accounts/:id/refresh` | 手动刷新 Token |
-| `GET/POST` | `/api/keys` | API Key 列表 / 创建 Key |
-| `PUT/DELETE` | `/api/keys/:id` | 更新 / 删除 Key |
-| `GET` | `/api/proxy/status` | 代理状态（无需认证） |
-| `GET` | `/api/proxy/health` | 健康报告（无需认证） |
-| `GET` | `/api/proxy/stats` | 详细统计 |
-| `GET` | `/api/proxy/logs` | 请求日志 |
-| `PUT` | `/api/proxy/config` | 更新运行时配置 |
-| `GET/PUT` | `/api/settings` | 获取 / 更新设置 |
-
-### 前端页面
-
-| 路径 | 说明 |
-|------|------|
-| `/` | 首页 |
-| `/docs` | API 文档 |
-| `/swagger` | Swagger UI |
-| `/playground` | 在线测试 |
-| `/deploy` | 部署指南 |
-| `/dashboard` | 监控面板 |
-| `/admin/accounts` | 账号管理 |
-| `/admin/keys` | API Key 管理 |
-
-### 支持的模型
-
-- `claude-opus-4-5`
-- `claude-sonnet-4-5`
-- `claude-sonnet-4`
-- `claude-haiku-4-5`
-- `claude-3-7-sonnet-20250219`
-
-## 💻 SDK 使用示例
-
-### Python (OpenAI SDK)
-
+**Python (OpenAI)：**
 ```python
 from openai import OpenAI
 
-client = OpenAI(
-    base_url="http://localhost:8000/v1",
-    api_key="your-secret-api-key"
-)
-
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="your-api-key")
 response = client.chat.completions.create(
     model="claude-sonnet-4-5",
     messages=[{"role": "user", "content": "Hello!"}],
     stream=True
 )
-
 for chunk in response:
     print(chunk.choices[0].delta.content, end="")
 ```
 
-### Python (Anthropic SDK)
-
+**Python (Anthropic)：**
 ```python
 import anthropic
 
-client = anthropic.Anthropic(
-    base_url="http://localhost:8000",
-    api_key="your-secret-api-key"
-)
-
+client = anthropic.Anthropic(base_url="http://localhost:8000", api_key="your-api-key")
 message = client.messages.create(
     model="claude-sonnet-4-5",
     max_tokens=1024,
@@ -238,91 +173,65 @@ message = client.messages.create(
 print(message.content[0].text)
 ```
 
-### Node.js (OpenAI SDK)
+### 支持的模型
 
-```javascript
-import OpenAI from "openai";
+`claude-opus-4-5` / `claude-sonnet-4-5` / `claude-sonnet-4` / `claude-haiku-4-5`
 
-const client = new OpenAI({
-  baseURL: "http://localhost:8000/v1",
-  apiKey: "your-secret-api-key",
-});
+## 客户端集成示例
 
-const stream = await client.chat.completions.create({
-  model: "claude-sonnet-4-5",
-  messages: [{ role: "user", content: "Hello!" }],
-  stream: true,
-});
+### OpenClaw
 
-for await (const chunk of stream) {
-  process.stdout.write(chunk.choices[0]?.delta?.content || "");
+编辑 `~/.openclaw/openclaw.json`：
+
+```json
+{
+  "models": {
+    "providers": {
+      "kiro": {
+        "baseUrl": "http://host.docker.internal:8000/v1",
+        "apiKey": "your-api-key",
+        "api": "openai-completions",
+        "models": [{
+          "id": "claude-sonnet-4-5",
+          "name": "Claude Sonnet 4.5 (Kiro)",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "contextWindow": 200000,
+          "maxTokens": 64000
+        }]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": "kiro/claude-sonnet-4-5" }
+    }
+  }
 }
 ```
 
-## 🐳 部署
+> Docker 容器访问宿主机用 `host.docker.internal`，本地直接用 `localhost`。
 
-### Docker
+## 管理面板
 
-```dockerfile
-FROM denoland/deno:latest
-WORKDIR /app
-COPY . .
-EXPOSE 8000
-CMD ["run", "--allow-net", "--allow-env", "--unstable-kv", "main.ts"]
-```
+| 路径 | 说明 |
+|------|------|
+| `/admin/accounts` | 账号管理 |
+| `/admin/keys` | API Key 管理 |
+| `/dashboard` | 监控面板 |
+| `/playground` | 在线测试 |
+| `/debug` | 调试面板 |
 
-```bash
-docker build -t kirogate .
-docker run -d -p 8000:8000 \
-  -e PROXY_API_KEY="your-key" \
-  -e ADMIN_PASSWORD="admin123" \
-  kirogate
-```
+## 注意事项
 
-### Docker Compose
+- Token 会自动刷新，关闭 Kiro 本地应用不影响使用
+- OIDC 客户端凭证有过期时间（通常几个月），过期后需重新登录 Kiro 获取
+- 服务绑定 127.0.0.1，外网无法直接访问
 
-```yaml
-version: "3"
-services:
-  kirogate:
-    build: .
-    ports:
-      - "8000:8000"
-    environment:
-      - PROXY_API_KEY=your-key
-      - ADMIN_PASSWORD=admin123
-    restart: unless-stopped
-```
+## 致谢
 
-### Deno Deploy
+基于 [kiro-openai-gateway](https://github.com/Jwadow/kiro-openai-gateway) 开发，整合 [kiro-account-manager](https://github.com/dext7r/kiro-account-manager) 功能。
 
-```bash
-deno install -A jsr:@deno/deployctl
-deployctl deploy --project=your-project main.ts
-```
-
-## 🏗️ 架构说明
-
-### 多账号调度
-
-账号池支持三种调度模式：
-- **Smart**（默认）— 基于健康分数 + 并发感知的智能调度
-- **Priority** — 按优先级顺序使用
-- **Balanced** — 均匀分配请求
-
-每个账号维护 0-100 的健康分数，基于成功率、错误率和冷却状态动态调整。全部账号不可用时自动触发自愈机制。
-
-### 上下文压缩
-
-当对话超过 token 阈值时自动触发：
-1. 保留最近 N 条消息不压缩
-2. 历史消息分批发送给 Claude Haiku 生成摘要
-3. 三层缓存加速：增量内存 → LRU 内存 → Deno KV 持久化
-
-### 熔断器
-
-采用 CLOSED → OPEN → HALF_OPEN 三态模型，连续失败达到阈值后自动熔断，保护后端服务。
-
-## 📄 许可证
+## 许可证
 
 [AGPL-3.0](LICENSE)

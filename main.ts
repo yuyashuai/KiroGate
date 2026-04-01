@@ -668,6 +668,7 @@ async function handleAccountsApi(req: Request, path: string): Promise<Response> 
     const accounts = accountPool.getAllAccounts()
     const safeAccounts = accounts.map(a => ({
       id: a.id, email: a.email, region: a.region || 'us-east-1',
+      authMethod: a.authMethod || null,
       subscriptionType: a.subscriptionType || 'unknown',
       hasRefreshToken: !!a.refreshToken, hasAccessToken: !!a.accessToken,
       expiresAt: a.expiresAt, machineId: a.machineId ? maskToken(a.machineId) : undefined,
